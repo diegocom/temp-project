@@ -2,7 +2,6 @@ import os
 import requests
 import json
 import logging
-from datetime import datetime
 
 # Configurazione
 SSC_URL = "https://your-ssc-instance-url.com/ssc/api/v1"
@@ -11,94 +10,144 @@ HEADERS = {
     'Authorization': f'FortifyToken {SSC_TOKEN}',
     'Accept': 'application/json'
 }
-DOWNLOAD_FOLDER = './fprs/'
-RETRY_FILE = 'retry_downloads.json'
-LOG_FILE = 'download_log.log'
-
-# Creazione cartella per gli FPR
-if not os.path.exists(DOWNLOAD_FOLDER):
-    os.makedirs(DOWNLOAD_FOLDER)
+UPLOAD_FOLDER = './fprs/'
+FAILED_UPLOADS_FILE = 'failed_uploads.json'
+LOG_FILE = 'upload_log.log'
 
 # Configurazione del logging
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-retry_list = []
+failed_uploads = []
 
-def get_applications():
-    url = f"{SSC_URL}/projects?limit=0"
+def get_or_create_application(app_name):
+    url = f"{SSC_URL}/projects?limit=0&q=name:{app_name}"
     response = requests.get(url, headers=HEADERS)
     response.raise_for_status()
-    return response.json()['data']
+    data = response.json()['data']
+    
+    if data:
+        app_id = data[0]['id']
+        logging.info(f"Application {app_name} already exists with ID {app_id}.")
+        return app_id
+    else:
+        create_url = f"{SSC_URL}/projects"
+        payload = {
+            'name': app_name,
+            'description': f"Auto-generated application {app_name}"
+        }
+        response = requests.post(create_url, headers=HEADERS, json=payload)
+        response.raise_for_status()
+        app_id = response.json()['data']['id']
+        logging.info(f"Created new application {app_name} with ID {app_id}.")
+        return app_id
 
-def get_versions(app_id):
-    url = f"{SSC_URL}/projects/{app_id}/versions?limit=0"
+def get_or_create_version(app_id, version_name):
+    url = f"{SSC_URL}/projects/{app_id}/versions?limit=0&q=name:{version_name}"
     response = requests.get(url, headers=HEADERS)
     response.raise_for_status()
-    return response.json()['data']
+    data = response.json()['data']
+    
+    if data:
+        version_id = data[0]['id']
+        logging.info(f"Version {version_name} already exists for application ID {app_id}.")
+        return version_id
+    else:
+        create_url = f"{SSC_URL}/projects/{app_id}/versions"
+        payload = {
+            'name': version_name,
+            'description': f"Auto-generated version {version_name}"
+        }
+        response = requests.post(create_url, headers=HEADERS, json=payload)
+        response.raise_for_status()
+        version_id = response.json()['data']['id']
+        logging.info(f"Created new version {version_name} for application ID {app_id}.")
+        return version_id
 
-def download_fpr(app_name, version_name, version_id):
-    fpr_filename = f"{app_name}|{version_name}.fpr"
-    file_path = os.path.join(DOWNLOAD_FOLDER, fpr_filename)
-    
-    if os.path.exists(file_path):
-        logging.info(f"File already exists: {fpr_filename}, skipping download.")
-        return
-    
-    url = f"{SSC_URL}/projectVersions/{version_id}/issueTemplate"
+def upload_fpr(version_id, file_path, app_name, version_name):
+    upload_url = f"{SSC_URL}/projectVersions/{version_id}/artifacts"
+    files = {'file': open(file_path, 'rb')}
     
     try:
-        response = requests.get(url, headers=HEADERS, stream=True)
+        response = requests.post(upload_url, headers={'Authorization': HEADERS['Authorization']}, files=files)
         response.raise_for_status()
-        
-        with open(file_path, 'wb') as fpr_file:
-            for chunk in response.iter_content(chunk_size=1024):
-                if chunk:
-                    fpr_file.write(chunk)
-        logging.info(f"Downloaded: {fpr_filename}")
+        logging.info(f"Uploaded FPR {file_path} to version ID {version_id}.")
     except Exception as e:
-        logging.error(f"Failed to download: {fpr_filename} - {str(e)}")
-        retry_list.append({
+        logging.error(f"Failed to upload FPR {file_path} - {str(e)}")
+        failed_uploads.append({
             'application': app_name,
             'version': version_name,
-            'version_id': version_id
+            'file_path': file_path
         })
 
-def retry_failed_downloads():
-    if not os.path.exists(RETRY_FILE):
-        logging.info("No retry file found, nothing to retry.")
+def process_fprs():
+    # Ottieni il numero totale di file FPR
+    total_files = len([f for f in os.listdir(UPLOAD_FOLDER) if f.endswith(".fpr")])
+    processed_files = 0
+    
+    for fpr_file in os.listdir(UPLOAD_FOLDER):
+        if fpr_file.endswith(".fpr"):
+            try:
+                # Split del nome del file in NOMEAPPLICATION e NOMEVERSION
+                app_name, version_name = os.path.splitext(fpr_file)[0].split(';')
+                file_path = os.path.join(UPLOAD_FOLDER, fpr_file)
+                
+                # Ottieni o crea l'applicazione e la versione
+                app_id = get_or_create_application(app_name)
+                version_id = get_or_create_version(app_id, version_name)
+                
+                # Carica il file FPR
+                upload_fpr(version_id, file_path, app_name, version_name)
+                
+                # Aggiorna lo stato di avanzamento
+                processed_files += 1
+                print(f"Processed {processed_files}/{total_files} files")
+                
+            except Exception as e:
+                logging.error(f"Error processing file {fpr_file}: {str(e)}")
+    
+    # Salva i tentativi di upload falliti
+    if failed_uploads:
+        with open(FAILED_UPLOADS_FILE, 'w') as failed_file:
+            json.dump(failed_uploads, failed_file, indent=4)
+        logging.warning(f"Failed uploads saved in {FAILED_UPLOADS_FILE}")
+
+def retry_failed_uploads():
+    if not os.path.exists(FAILED_UPLOADS_FILE):
+        logging.info("No failed uploads file found, nothing to retry.")
         return
     
-    with open(RETRY_FILE, 'r') as retry_file:
-        failed_downloads = json.load(retry_file)
+    with open(FAILED_UPLOADS_FILE, 'r') as failed_file:
+        failed_uploads = json.load(failed_file)
     
-    for item in failed_downloads:
-        download_fpr(item['application'], item['version'], item['version_id'])
+    remaining_failures = []
+    total_failed = len(failed_uploads)
+    processed_failed = 0
     
-    if not retry_list:
-        logging.info("All failed downloads retried successfully.")
-    else:
-        logging.warning(f"{len(retry_list)} downloads still failed. Retry file will be updated.")
-        with open(RETRY_FILE, 'w') as retry_file:
-            json.dump(retry_list, retry_file, indent=4)
-
-def main():
-    applications = get_applications()
-    for app in applications:
-        app_name = app['name']
-        app_id = app['id']
-        versions = get_versions(app_id)
+    for item in failed_uploads:
+        app_name = item['application']
+        version_name = item['version']
+        file_path = item['file_path']
         
-        for version in versions:
-            version_name = version['name']
-            version_id = version['id']
-            download_fpr(app_name, version_name, version_id)
+        try:
+            app_id = get_or_create_application(app_name)
+            version_id = get_or_create_version(app_id, version_name)
+            upload_fpr(version_id, file_path, app_name, version_name)
+            
+            # Aggiorna lo stato di avanzamento dei retry
+            processed_failed += 1
+            print(f"Retried {processed_failed}/{total_failed} failed files")
+            
+        except Exception as e:
+            logging.error(f"Error retrying upload for file {file_path}: {str(e)}")
+            remaining_failures.append(item)
     
-    if retry_list:
-        with open(RETRY_FILE, 'w') as retry_file:
-            json.dump(retry_list, retry_file, indent=4)
-        logging.warning(f"Retry file created: {RETRY_FILE}")
+    if remaining_failures:
+        with open(FAILED_UPLOADS_FILE, 'w') as failed_file:
+            json.dump(remaining_failures, failed_file, indent=4)
+        logging.warning(f"Remaining failed uploads saved in {FAILED_UPLOADS_FILE}")
     else:
-        logging.info("All downloads completed successfully.")
+        os.remove(FAILED_UPLOADS_FILE)
+        logging.info("All failed uploads retried successfully.")
 
 if __name__ == "__main__":
-    main()
+    process_fprs()
