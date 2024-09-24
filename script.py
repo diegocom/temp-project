@@ -1,153 +1,68 @@
-import os
 import requests
 import json
-import logging
 
-# Configurazione
-SSC_URL = "https://your-ssc-instance-url.com/ssc/api/v1"
-SSC_TOKEN = "your-ssc-token"
-HEADERS = {
-    'Authorization': f'FortifyToken {SSC_TOKEN}',
-    'Accept': 'application/json'
-}
-UPLOAD_FOLDER = './fprs/'
-FAILED_UPLOADS_FILE = 'failed_uploads.json'
-LOG_FILE = 'upload_log.log'
+# Configurazione dell'API Fortify SSC
+SSC_BASE_URL = "https://fortify-ssc.example.com/ssc"  # URL base di Fortify SSC
+API_VERSION = "v1"  # La versione API di SSC
+USERNAME = "your_username"
+PASSWORD = "your_password"
 
-# Configurazione del logging
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Imposta l'URL per autenticarsi ed ottenere il token
+AUTH_URL = f"{SSC_BASE_URL}/api/{API_VERSION}/auth/token"
 
-failed_uploads = []
-
-def get_or_create_application(app_name):
-    url = f"{SSC_URL}/projects?limit=0&q=name:{app_name}"
-    response = requests.get(url, headers=HEADERS)
-    response.raise_for_status()
-    data = response.json()['data']
-    
-    if data:
-        app_id = data[0]['id']
-        logging.info(f"Application {app_name} already exists with ID {app_id}.")
-        return app_id
+# Ottieni il token di autenticazione
+def get_auth_token():
+    response = requests.post(AUTH_URL, auth=(USERNAME, PASSWORD))
+    if response.status_code == 200:
+        return response.json()["data"]["token"]
     else:
-        create_url = f"{SSC_URL}/projects"
-        payload = {
-            'name': app_name,
-            'description': f"Auto-generated application {app_name}"
-        }
-        response = requests.post(create_url, headers=HEADERS, json=payload)
-        response.raise_for_status()
-        app_id = response.json()['data']['id']
-        logging.info(f"Created new application {app_name} with ID {app_id}.")
-        return app_id
+        print(f"Errore durante l'autenticazione: {response.status_code}")
+        print(response.text)
+        return None
 
-def get_or_create_version(app_id, version_name):
-    url = f"{SSC_URL}/projects/{app_id}/versions?limit=0&q=name:{version_name}"
-    response = requests.get(url, headers=HEADERS)
-    response.raise_for_status()
-    data = response.json()['data']
+# Recupera le applicazioni nello stato 'Finish Later'
+def get_uncommitted_applications(token):
+    url = f"{SSC_BASE_URL}/api/{API_VERSION}/projectVersions?filter=commitState:FINISH_LATER"
+    headers = {"Authorization": f"FortifyToken {token}"}
+    response = requests.get(url, headers=headers)
     
-    if data:
-        version_id = data[0]['id']
-        logging.info(f"Version {version_name} already exists for application ID {app_id}.")
-        return version_id
+    if response.status_code == 200:
+        return response.json()["data"]
     else:
-        create_url = f"{SSC_URL}/projects/{app_id}/versions"
-        payload = {
-            'name': version_name,
-            'description': f"Auto-generated version {version_name}"
-        }
-        response = requests.post(create_url, headers=HEADERS, json=payload)
-        response.raise_for_status()
-        version_id = response.json()['data']['id']
-        logging.info(f"Created new version {version_name} for application ID {app_id}.")
-        return version_id
+        print(f"Errore nel recupero delle applicazioni: {response.status_code}")
+        print(response.text)
+        return []
 
-def upload_fpr(version_id, file_path, app_name, version_name):
-    upload_url = f"{SSC_URL}/projectVersions/{version_id}/artifacts"
-    files = {'file': open(file_path, 'rb')}
-    
-    try:
-        response = requests.post(upload_url, headers={'Authorization': HEADERS['Authorization']}, files=files)
-        response.raise_for_status()
-        logging.info(f"Uploaded FPR {file_path} to version ID {version_id}.")
-    except Exception as e:
-        logging.error(f"Failed to upload FPR {file_path} - {str(e)}")
-        failed_uploads.append({
-            'application': app_name,
-            'version': version_name,
-            'file_path': file_path
-        })
+# Commit delle applicazioni
+def commit_application(app_id, token):
+    url = f"{SSC_BASE_URL}/api/{API_VERSION}/projectVersions/{app_id}/commit"
+    headers = {"Authorization": f"FortifyToken {token}", "Content-Type": "application/json"}
+    response = requests.post(url, headers=headers)
 
-def process_fprs():
-    # Ottieni il numero totale di file FPR
-    total_files = len([f for f in os.listdir(UPLOAD_FOLDER) if f.endswith(".fpr")])
-    processed_files = 0
-    
-    for fpr_file in os.listdir(UPLOAD_FOLDER):
-        if fpr_file.endswith(".fpr"):
-            try:
-                # Split del nome del file in NOMEAPPLICATION e NOMEVERSION
-                app_name, version_name = os.path.splitext(fpr_file)[0].split(';')
-                file_path = os.path.join(UPLOAD_FOLDER, fpr_file)
-                
-                # Ottieni o crea l'applicazione e la versione
-                app_id = get_or_create_application(app_name)
-                version_id = get_or_create_version(app_id, version_name)
-                
-                # Carica il file FPR
-                upload_fpr(version_id, file_path, app_name, version_name)
-                
-                # Aggiorna lo stato di avanzamento
-                processed_files += 1
-                print(f"Processed {processed_files}/{total_files} files")
-                
-            except Exception as e:
-                logging.error(f"Error processing file {fpr_file}: {str(e)}")
-    
-    # Salva i tentativi di upload falliti
-    if failed_uploads:
-        with open(FAILED_UPLOADS_FILE, 'w') as failed_file:
-            json.dump(failed_uploads, failed_file, indent=4)
-        logging.warning(f"Failed uploads saved in {FAILED_UPLOADS_FILE}")
+    if response.status_code == 200:
+        print(f"Commit completato per l'applicazione {app_id}")
+    else:
+        print(f"Errore durante il commit dell'applicazione {app_id}: {response.status_code}")
+        print(response.text)
 
-def retry_failed_uploads():
-    if not os.path.exists(FAILED_UPLOADS_FILE):
-        logging.info("No failed uploads file found, nothing to retry.")
-        return
+def main():
+    # Ottieni il token di autenticazione
+    token = get_auth_token()
     
-    with open(FAILED_UPLOADS_FILE, 'r') as failed_file:
-        failed_uploads = json.load(failed_file)
-    
-    remaining_failures = []
-    total_failed = len(failed_uploads)
-    processed_failed = 0
-    
-    for item in failed_uploads:
-        app_name = item['application']
-        version_name = item['version']
-        file_path = item['file_path']
+    if token:
+        # Recupera le applicazioni non completate
+        applications = get_uncommitted_applications(token)
         
-        try:
-            app_id = get_or_create_application(app_name)
-            version_id = get_or_create_version(app_id, version_name)
-            upload_fpr(version_id, file_path, app_name, version_name)
-            
-            # Aggiorna lo stato di avanzamento dei retry
-            processed_failed += 1
-            print(f"Retried {processed_failed}/{total_failed} failed files")
-            
-        except Exception as e:
-            logging.error(f"Error retrying upload for file {file_path}: {str(e)}")
-            remaining_failures.append(item)
-    
-    if remaining_failures:
-        with open(FAILED_UPLOADS_FILE, 'w') as failed_file:
-            json.dump(remaining_failures, failed_file, indent=4)
-        logging.warning(f"Remaining failed uploads saved in {FAILED_UPLOADS_FILE}")
+        if applications:
+            # Cicla tra le applicazioni e fai il commit
+            for app in applications:
+                app_id = app["id"]
+                print(f"Effettuo il commit dell'applicazione {app['name']} con ID {app_id}")
+                commit_application(app_id, token)
+        else:
+            print("Nessuna applicazione nello stato 'Finish Later' trovata.")
     else:
-        os.remove(FAILED_UPLOADS_FILE)
-        logging.info("All failed uploads retried successfully.")
+        print("Errore durante l'autenticazione. Script terminato.")
 
 if __name__ == "__main__":
-    process_fprs()
+    main()
